@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -421,24 +422,26 @@ func parseB2BDetailsRecord(line string) (B2BDetailsRecord, error) {
 // --------------------------------------------------------------------------
 
 func main() {
-	var r io.Reader
-	switch len(os.Args) {
-	case 1:
-		r = os.Stdin
-	case 2:
-		f, err := os.Open(os.Args[1])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error opening file: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		r = f
-	default:
-		fmt.Fprintln(os.Stderr, "usage: nem12 [file]")
+	dbPath := flag.String("db", "", "path to SQLite database file (created if absent); omit to skip persistence")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: nem12 [-db <path>] <nem12-file>\n\nFlags:\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() != 1 {
+		flag.Usage()
 		os.Exit(2)
 	}
 
-	records, err := Parse(r)
+	f, err := os.Open(flag.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error opening file: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	records, err := Parse(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
 		os.Exit(1)
@@ -474,4 +477,31 @@ func main() {
 			fmt.Println("[900] End of data")
 		}
 	}
+
+	if *dbPath == "" {
+		return
+	}
+
+	db, err := OpenDB(*dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	if err := InitSchema(db); err != nil {
+		fmt.Fprintf(os.Stderr, "schema error: %v\n", err)
+		os.Exit(1)
+	}
+
+	readings := RecordsToReadings(records)
+	fmt.Printf("writing %d readings to %s using %d workers…\n",
+		len(readings), *dbPath, dbWorkerPoolSize)
+
+	if err := WriteReadings(db, readings); err != nil {
+		fmt.Fprintf(os.Stderr, "write error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("done – %d rows persisted\n", len(readings))
 }

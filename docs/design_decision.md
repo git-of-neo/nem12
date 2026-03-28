@@ -2,6 +2,8 @@
 1. Reminds me of the "1 Billion Row Challenge" from a few years back.
 2. Setting aside low-level tricks like SIMD, memory swapping, and other hacks, some kind of buffered I/O should be a good baseline; let's go with that for this.
 3. The requirements specify it will be used to "handle files of very large sizes," so let's pick a language that isn't too slow (crossing out Python...). Rust would be a performant, fun experiment, but I'm going to stick with Golang since it's performant enough and I am familiar with it.
+4. Since we need a database but it mentions "does not include any form of infrastructure and deployment
+code" lets just stick with a in-memory sqlite for its the easiest DB to spin up w/o any infra.
 
 ## General Idea
 1. Code a parser for NEM12.
@@ -14,6 +16,7 @@
         - B2B details record (500)
         - End of data (900)
 2. Use `bufio` to load data and parse the rows serially.
+3. Spawn go routines to write to INSERT into sqlite. Use a pool for this with a variable constant controlling the pool size so we dont overload the database with concurrent writes.
 
 ## Testing Plan
 1. Use `go:embed` for the provided sample data (named `sample.NEM12`) and test it against the four expectations provided in the document:
@@ -21,3 +24,4 @@
     - The interval length (the ninth value in the `200 record` — `30` in this example).
     - The interval date (the second value in the `300 record` — e.g., `20050301`).
     - The interval values, which we call consumption (values 3-50 in the `300 record` — e.g., `0.461`).
+2. Use in memory sqlite to test the writing functions to database
