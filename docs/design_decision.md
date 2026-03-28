@@ -14,7 +14,7 @@
         - Interval event record (400)
         - B2B details record (500)
         - End of data (900)
-2. Use `bufio` to load data and parse rows serially.
+2. Use a streaming `Parser` advancing one logical record at a time (100 record -> 900 record) Only the current record is live in memory at any point, preventing OOM on large files.
 3. Spawn goroutines to handle SQLite `INSERT` operations. I'll use a worker pool with a configurable constant to control the pool size, ensuring the database isn't overloaded by concurrent writes.
 4. Use a persistent, local SQLite database to verify the final output.
 

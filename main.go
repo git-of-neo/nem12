@@ -97,7 +97,7 @@ type EndOfDataRecord struct{}
 func (r EndOfDataRecord) Type() RecordType { return RecordTypeEndOfData }
 
 // knownRecordTypes is the set of valid NEM12 record-type identifier strings.
-// It is used by stitchLines to detect the start of a new logical record.
+// It is used by Parser to detect the start of a new logical record.
 var knownRecordTypes = map[string]bool{
 	"100": true,
 	"200": true,
@@ -107,120 +107,147 @@ var knownRecordTypes = map[string]bool{
 	"900": true,
 }
 
-// Parse reads a NEM12 file from r and returns the parsed records in file order.
+// --------------------------------------------------------------------------
+// Streaming parser
+// --------------------------------------------------------------------------
+
+// Parser reads a NEM12 stream and yields one Record at a time via Next.
 //
-// NEM12 files sometimes contain physical line breaks in the middle of a logical
-// record — for example when a number such as "1.271" is wrapped across two lines
-// as "1." and "271". Parse handles this transparently by stitching physical lines
-// back into complete logical records before parsing any fields.
-func Parse(r io.Reader) ([]Record, error) {
-	logicalLines, err := stitchLines(r)
-	if err != nil {
-		return nil, fmt.Errorf("reading NEM12 input: %w", err)
-	}
-
-	var records []Record
-
-	// intervalLength is carried forward from the most recent 200 record so that
-	// subsequent 300 records know how many interval values to expect.
-	var currentIntervalLength int
-
-	for _, line := range logicalLines {
-		if line == "" {
-			continue
-		}
-
-		// The record type is always the first comma-separated token.
-		typeStr, _, _ := strings.Cut(line, ",")
-
-		switch typeStr {
-		case "100":
-			rec, err := parseHeaderRecord(line)
-			if err != nil {
-				return nil, fmt.Errorf("100 record: %w", err)
-			}
-			records = append(records, rec)
-
-		case "200":
-			rec, err := parseNMIDataDetailsRecord(line)
-			if err != nil {
-				return nil, fmt.Errorf("200 record: %w", err)
-			}
-			currentIntervalLength = rec.IntervalLength
-			records = append(records, rec)
-
-		case "300":
-			rec, err := parseIntervalDataRecord(line, currentIntervalLength)
-			if err != nil {
-				return nil, fmt.Errorf("300 record: %w", err)
-			}
-			records = append(records, rec)
-
-		case "400":
-			rec, err := parseIntervalEventRecord(line)
-			if err != nil {
-				return nil, fmt.Errorf("400 record: %w", err)
-			}
-			records = append(records, rec)
-
-		case "500":
-			rec, err := parseB2BDetailsRecord(line)
-			if err != nil {
-				return nil, fmt.Errorf("500 record: %w", err)
-			}
-			records = append(records, rec)
-
-		case "900":
-			records = append(records, EndOfDataRecord{})
-
-		default:
-			return nil, fmt.Errorf("unknown record type %q", typeStr)
-		}
-	}
-
-	return records, nil
+// Physical line continuation (where a logical record is split across multiple
+// physical lines) is handled transparently: continuation lines are stitched
+// onto the current logical line until a new record-type prefix is seen.
+//
+// Memory usage is O(1) with respect to file size — only the current physical
+// line and the logical record under construction are live at any point.
+type Parser struct {
+	scanner        *bufio.Scanner
+	current        strings.Builder
+	intervalLength int  // carried forward from the most recent 200 record
+	exhausted      bool // true once the scanner has reached EOF or an error
 }
 
-// stitchLines reads all physical lines from r and joins continuation lines
-// (those that do not begin with a known NEM12 record-type identifier) directly
-// onto the preceding line with no separator. This correctly reconstructs numbers
-// and field values that were split at an arbitrary column width.
-func stitchLines(r io.Reader) ([]string, error) {
-	scanner := bufio.NewScanner(r)
+// NewParser returns a Parser that reads NEM12 data from r.
+func NewParser(r io.Reader) *Parser {
+	return &Parser{scanner: bufio.NewScanner(r)}
+}
 
-	var logical []string
-	var current strings.Builder
+// Next returns the next parsed Record from the stream.
+// It returns (nil, io.EOF) when the file is fully consumed.
+// Any other non-nil error indicates an I/O or parse failure.
+func (p *Parser) Next() (Record, error) {
+	for !p.exhausted {
+		if !p.scanner.Scan() {
+			p.exhausted = true
+			if err := p.scanner.Err(); err != nil {
+				return nil, err
+			}
+			break
+		}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(p.scanner.Text())
 		if line == "" {
 			continue
 		}
 
-		// Check whether this physical line starts a new logical record by
-		// inspecting its first comma-delimited token.
 		prefix, _, _ := strings.Cut(line, ",")
-		if knownRecordTypes[prefix] {
-			// Save the completed logical line before starting the next one.
-			if current.Len() > 0 {
-				logical = append(logical, current.String())
-				current.Reset()
-			}
+		if knownRecordTypes[prefix] && p.current.Len() > 0 {
+			// The previous logical record is now complete. Parse it, stash the
+			// opening line of the next record in current, and return.
+			logical := p.current.String()
+			p.current.Reset()
+			p.current.WriteString(line)
+			return p.parseLogicalLine(logical)
 		}
 
-		// Append without any separator: a continuation line resumes exactly
-		// where the previous one left off, even mid-number or mid-field.
-		current.WriteString(line)
+		// Either this is the very first line, or it is a continuation line
+		// that belongs to the record already accumulating in current.
+		p.current.WriteString(line)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	if current.Len() > 0 {
-		logical = append(logical, current.String())
+	// Flush the final logical record once the scanner is exhausted.
+	if p.current.Len() > 0 {
+		logical := p.current.String()
+		p.current.Reset()
+		return p.parseLogicalLine(logical)
 	}
 
-	return logical, nil
+	return nil, io.EOF
+}
+
+// parseLogicalLine parses a single complete logical line and returns the
+// corresponding Record. It updates p.intervalLength whenever a 200 record is
+// seen so that subsequent 300 records know how many interval values to expect.
+func (p *Parser) parseLogicalLine(line string) (Record, error) {
+	typeStr, _, _ := strings.Cut(line, ",")
+
+	switch typeStr {
+	case "100":
+		rec, err := parseHeaderRecord(line)
+		if err != nil {
+			return nil, fmt.Errorf("100 record: %w", err)
+		}
+		return rec, nil
+
+	case "200":
+		rec, err := parseNMIDataDetailsRecord(line)
+		if err != nil {
+			return nil, fmt.Errorf("200 record: %w", err)
+		}
+		p.intervalLength = rec.IntervalLength
+		return rec, nil
+
+	case "300":
+		rec, err := parseIntervalDataRecord(line, p.intervalLength)
+		if err != nil {
+			return nil, fmt.Errorf("300 record: %w", err)
+		}
+		return rec, nil
+
+	case "400":
+		rec, err := parseIntervalEventRecord(line)
+		if err != nil {
+			return nil, fmt.Errorf("400 record: %w", err)
+		}
+		return rec, nil
+
+	case "500":
+		rec, err := parseB2BDetailsRecord(line)
+		if err != nil {
+			return nil, fmt.Errorf("500 record: %w", err)
+		}
+		return rec, nil
+
+	case "900":
+		return EndOfDataRecord{}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown record type %q", typeStr)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Convenience batch parser (used by tests)
+// --------------------------------------------------------------------------
+
+// Parse reads a complete NEM12 file from r and returns all records in file
+// order. It is a thin wrapper around Parser.Next() that collects every record
+// into a slice.
+//
+// For large files where memory is a concern, use NewParser and call Next() in
+// a loop so that only one record is live in memory at a time.
+func Parse(r io.Reader) ([]Record, error) {
+	p := NewParser(r)
+	var records []Record
+	for {
+		rec, err := p.Next()
+		if err == io.EOF {
+			return records, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading NEM12 input: %w", err)
+		}
+		records = append(records, rec)
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -436,13 +463,55 @@ func main() {
 	}
 	defer f.Close()
 
-	records, err := Parse(f)
+	db, err := OpenDB(dbFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	if err := ResetSchema(db); err != nil {
+		fmt.Fprintf(os.Stderr, "schema reset error: %v\n", err)
 		os.Exit(1)
 	}
 
-	for _, rec := range records {
+	// readingsCh bridges the parser and the DB writer pool. It is buffered so
+	// that the parser can run ahead of the writers without blocking.
+	readingsCh := make(chan MeterReading, dbWorkerPoolSize*256)
+
+	// Start the DB writer in the background. writeErrCh receives exactly one
+	// value — the first write error or nil — once readingsCh is closed and all
+	// workers have drained.
+	writeErrCh := make(chan error, 1)
+	go func() {
+		writeErrCh <- StreamWriteReadings(db, readingsCh)
+	}()
+
+	// Stream the file one logical record at a time. Each IntervalDataRecord is
+	// immediately expanded into per-interval MeterReadings and sent to the DB
+	// writer, so neither the full record list nor the full reading list ever
+	// accumulates in memory.
+	parser := NewParser(f)
+
+	var (
+		currentNMI     string
+		intervalLength = 30 // overwritten by each 200 record
+		readingCount   int
+	)
+
+	fmt.Printf("streaming to %s using %d workers…\n", dbFile, dbWorkerPoolSize)
+
+	for {
+		rec, err := parser.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Print the record to stdout for manual inspection.
 		switch v := rec.(type) {
 		case HeaderRecord:
 			fmt.Printf("[100] NEM12 | Created: %s | From: %s → To: %s\n",
@@ -451,6 +520,8 @@ func main() {
 		case NMIDataDetailsRecord:
 			fmt.Printf("[200] NMI: %-12s | UOM: %-4s | Interval: %d min\n",
 				v.NMI, v.UOM, v.IntervalLength)
+			currentNMI = v.NMI
+			intervalLength = v.IntervalLength
 
 		case IntervalDataRecord:
 			total := 0.0
@@ -459,6 +530,18 @@ func main() {
 			}
 			fmt.Printf("[300] Date: %s | Periods: %2d | Daily total: %.3f\n",
 				v.IntervalDate.Format("2006-01-02"), len(v.IntervalValues), total)
+
+			// Expand each interval period into a MeterReading and hand it off
+			// to the DB writer immediately — no slice accumulation.
+			for i, val := range v.IntervalValues {
+				ts := v.IntervalDate.Add(time.Duration(i*intervalLength) * time.Minute)
+				readingsCh <- MeterReading{
+					NMI:         currentNMI,
+					Timestamp:   ts,
+					Consumption: val,
+				}
+				readingCount++
+			}
 
 		case IntervalEventRecord:
 			fmt.Printf("[400] Intervals %d–%d | Quality: %s | Reason: %s\n",
@@ -473,26 +556,14 @@ func main() {
 		}
 	}
 
-	db, err := OpenDB(dbFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
-		os.Exit(1)
-	}
-	defer db.Close()
+	// Signal to the writer pool that no more readings are coming, then wait
+	// for it to finish before reporting the final count.
+	close(readingsCh)
 
-	if err := ResetSchema(db); err != nil {
-		fmt.Fprintf(os.Stderr, "schema reset error: %v\n", err)
-		os.Exit(1)
-	}
-
-	readings := RecordsToReadings(records)
-	fmt.Printf("writing %d readings to %s using %d workers…\n",
-		len(readings), dbFile, dbWorkerPoolSize)
-
-	if err := WriteReadings(db, readings); err != nil {
+	if err := <-writeErrCh; err != nil {
 		fmt.Fprintf(os.Stderr, "write error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("done – %d rows persisted\n", len(readings))
+	fmt.Printf("done – %d rows persisted\n", readingCount)
 }

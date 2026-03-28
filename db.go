@@ -132,29 +132,27 @@ func RecordsToReadings(records []Record) []MeterReading {
 	return readings
 }
 
-// WriteReadings persists all readings to the database using a bounded worker
-// pool of dbWorkerPoolSize goroutines. Each goroutine draws work from a shared
-// jobs channel and issues individual INSERT statements. Duplicate rows
-// (same nmi + timestamp) are silently ignored via ON CONFLICT DO NOTHING.
+// StreamWriteReadings persists readings to the database as they arrive on the
+// readings channel, using a bounded worker pool of dbWorkerPoolSize goroutines.
+// It blocks until the channel is closed and all workers have finished.
 //
-// The first insertion error encountered by any worker is returned; subsequent
-// errors are discarded to keep the implementation lock-free. A nil return means
-// every row was written (or gracefully skipped as a duplicate).
-func WriteReadings(db *sql.DB, readings []MeterReading) error {
-	jobs := make(chan MeterReading)
-
+// Duplicate rows (same nmi + timestamp) are silently ignored via
+// ON CONFLICT DO NOTHING. The first insertion error encountered by any worker
+// is returned; a nil return means every row was written or gracefully skipped.
+func StreamWriteReadings(db *sql.DB, readings <-chan MeterReading) error {
 	var (
 		wg       sync.WaitGroup
 		firstErr error
 		errOnce  sync.Once
 	)
 
-	// Start the fixed-size worker pool.
+	// All workers read from the same channel; Go's channel semantics ensure
+	// each MeterReading is delivered to exactly one worker.
 	for range dbWorkerPoolSize {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for r := range jobs {
+			for r := range readings {
 				if err := insertReading(db, r); err != nil {
 					errOnce.Do(func() { firstErr = err })
 				}
@@ -162,14 +160,21 @@ func WriteReadings(db *sql.DB, readings []MeterReading) error {
 		}()
 	}
 
-	// Feed every reading into the pool, then signal completion.
-	for _, r := range readings {
-		jobs <- r
-	}
-	close(jobs)
-
 	wg.Wait()
 	return firstErr
+}
+
+// WriteReadings persists all readings to the database using StreamWriteReadings.
+// It is a convenience wrapper for callers that already hold a []MeterReading
+// (e.g. tests). For large files prefer StreamWriteReadings with a channel so
+// that readings are never fully materialised in memory.
+func WriteReadings(db *sql.DB, readings []MeterReading) error {
+	ch := make(chan MeterReading, len(readings))
+	for _, r := range readings {
+		ch <- r
+	}
+	close(ch)
+	return StreamWriteReadings(db, ch)
 }
 
 // insertReading inserts a single MeterReading into meter_readings.
