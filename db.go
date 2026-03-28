@@ -57,14 +57,14 @@ func OpenDB(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("setting busy_timeout: %w", err)
 	}
 
-	if isMemory {
-		// Pin to one connection so every caller sees the same in-memory DB.
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
-	} else {
-		// Cap the pool to match the writer pool size.
-		db.SetMaxOpenConns(dbWorkerPoolSize)
-	}
+	// SQLite allows only one writer at a time regardless of journal mode.
+	// Pinning to a single connection lets the database/sql pool serialise all
+	// writes naturally — goroutines in WriteReadings still run concurrently and
+	// queue their INSERT calls through this one connection instead of racing for
+	// the write lock and hitting SQLITE_BUSY.
+	// For :memory: this also ensures every caller sees the same in-memory DB.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	return db, nil
 }
@@ -74,6 +74,7 @@ func OpenDB(dsn string) (*sql.DB, error) {
 // timestamps as RFC 3339 strings, which SQLite handles via TEXT affinity.
 // Calling InitSchema on a database that already has the table is a no-op.
 func InitSchema(db *sql.DB) error {
+	// Adapated DDL statement for sqlite
 	const ddl = `
 CREATE TABLE IF NOT EXISTS meter_readings (
     id          TEXT NOT NULL,
@@ -87,6 +88,16 @@ CREATE TABLE IF NOT EXISTS meter_readings (
 		return fmt.Errorf("creating meter_readings table: %w", err)
 	}
 	return nil
+}
+
+// ResetSchema drops meter_readings if it exists and recreates it from scratch.
+// Call this at the start of each program run to guarantee a clean slate —
+// previous data is discarded and the table is always in a known-good state.
+func ResetSchema(db *sql.DB) error {
+	if _, err := db.Exec(`DROP TABLE IF EXISTS meter_readings;`); err != nil {
+		return fmt.Errorf("dropping meter_readings: %w", err)
+	}
+	return InitSchema(db)
 }
 
 // RecordsToReadings walks a slice of parsed NEM12 records and expands every

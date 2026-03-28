@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -421,20 +420,16 @@ func parseB2BDetailsRecord(line string) (B2BDetailsRecord, error) {
 // CLI entry point
 // --------------------------------------------------------------------------
 
-func main() {
-	dbPath := flag.String("db", "", "path to SQLite database file (created if absent); omit to skip persistence")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: nem12 [-db <path>] <nem12-file>\n\nFlags:\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
+// dbFile is the path to the persistent SQLite database written on every run.
+const dbFile = "meter_readings.db"
 
-	if flag.NArg() != 1 {
-		flag.Usage()
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: nem12 <nem12-file>")
 		os.Exit(2)
 	}
 
-	f, err := os.Open(flag.Arg(0))
+	f, err := os.Open(os.Args[1])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening file: %v\n", err)
 		os.Exit(1)
@@ -478,25 +473,21 @@ func main() {
 		}
 	}
 
-	if *dbPath == "" {
-		return
-	}
-
-	db, err := OpenDB(*dbPath)
+	db, err := OpenDB(dbFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "db error: %v\n", err)
 		os.Exit(1)
 	}
 	defer db.Close()
 
-	if err := InitSchema(db); err != nil {
-		fmt.Fprintf(os.Stderr, "schema error: %v\n", err)
+	if err := ResetSchema(db); err != nil {
+		fmt.Fprintf(os.Stderr, "schema reset error: %v\n", err)
 		os.Exit(1)
 	}
 
 	readings := RecordsToReadings(records)
 	fmt.Printf("writing %d readings to %s using %d workers…\n",
-		len(readings), *dbPath, dbWorkerPoolSize)
+		len(readings), dbFile, dbWorkerPoolSize)
 
 	if err := WriteReadings(db, readings); err != nil {
 		fmt.Fprintf(os.Stderr, "write error: %v\n", err)
