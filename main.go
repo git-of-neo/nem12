@@ -123,7 +123,7 @@ func Parse(r io.Reader) ([]Record, error) {
 
 	// intervalLength is carried forward from the most recent 200 record so that
 	// subsequent 300 records know how many interval values to expect.
-	currentIntervalLength := 30
+	var currentIntervalLength int
 
 	for _, line := range logicalLines {
 		if line == "" {
